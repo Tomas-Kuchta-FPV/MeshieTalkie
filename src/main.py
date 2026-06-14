@@ -14,7 +14,7 @@ import sherpa_onnx
 project_name = "meshie-talkie"
 
 BASE_DIR = Path(__file__).resolve().parent
-DEFAULT_MODEL_DIR = BASE_DIR / "models" / "sherpa-onnx-streaming-zipformer-en-20M-2023-02-17"
+DEFAULT_MODEL_DIR = BASE_DIR / "models" / "sherpa-onnx-whisper-tiny.en"
 
 
 def ensure_file_exists(path: Path):
@@ -48,14 +48,24 @@ def transcribe_wav_file(recognizer, wav_path: Path) -> str:
                 break
             samples = np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32768.0
             stream.accept_waveform(sample_rate, samples)
-            while recognizer.is_ready(stream):
-                recognizer.decode_stream(stream)
 
-    stream.input_finished()
-    while recognizer.is_ready(stream):
+            if hasattr(recognizer, "is_ready"):
+                while recognizer.is_ready(stream):
+                    recognizer.decode_stream(stream)
+
+    if hasattr(stream, "input_finished"):
+        stream.input_finished()
+
+        while recognizer.is_ready(stream):
+            recognizer.decode_stream(stream)
+    else:
         recognizer.decode_stream(stream)
 
-    return recognizer.get_result(stream)
+    if hasattr(recognizer, "get_result"):
+        result = recognizer.get_result(stream)
+        return getattr(result, "text", result).strip()
+
+    return getattr(stream.result, "text", str(stream.result)).strip()
 
 
 class TerminalRawInput:
@@ -73,25 +83,16 @@ class TerminalRawInput:
         termios.tcsetattr(self.fd, termios.TCSADRAIN, self.previous_settings)
 
 def create_recognizer(model_dir: Path):
-    for filename in ("tokens.txt", "encoder-epoch-99-avg-1.int8.onnx", "decoder-epoch-99-avg-1.int8.onnx", "joiner-epoch-99-avg-1.int8.onnx"):
+    for filename in ("tiny.en-encoder.int8.onnx", "tiny.en-decoder.int8.onnx", "tiny.en-tokens.txt"):
         ensure_file_exists(model_dir / filename)
 
-    recognizer = sherpa_onnx.OnlineRecognizer.from_transducer(
-        tokens=str(model_dir / "tokens.txt"),
-        encoder=str(model_dir / "encoder-epoch-99-avg-1.int8.onnx"),
-        decoder=str(model_dir / "decoder-epoch-99-avg-1.int8.onnx"),
-        joiner=str(model_dir / "joiner-epoch-99-avg-1.int8.onnx"),
+    recognizer = sherpa_onnx.OfflineRecognizer.from_whisper(
+        encoder=str(model_dir / "tiny.en-encoder.int8.onnx"),
+        decoder=str(model_dir / "tiny.en-decoder.int8.onnx"),
+        tokens=str(model_dir / "tiny.en-tokens.txt"),
         num_threads=1,
-        sample_rate=16000,
-        feature_dim=80,
         decoding_method="greedy_search",
-        max_active_paths=4,
         provider="cpu",
-        hotwords_file="",
-        hotwords_score=1.5,
-        blank_penalty=0.0,
-        hr_rule_fsts="",
-        hr_lexicon="",
     )
     return recognizer
 
@@ -103,7 +104,7 @@ def main():
     model_dir = DEFAULT_MODEL_DIR
     print(f"Using model_dir: {model_dir}")
     recognizer = create_recognizer(model_dir)
-    print("Started! Hold 't' to record, then release to transcribe")
+    print("Started! Hold 't' to record, then release to transcribe with Whisper")
 
     sample_rate = 16000
     hold_timeout = 0.7

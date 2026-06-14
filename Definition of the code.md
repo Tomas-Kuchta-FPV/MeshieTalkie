@@ -7,6 +7,14 @@ The first working prototype should be simple and also no vibecoding.
   - For now Whisper
   - then I'll think about FireRedASR
 
+### Code cycle
+- init
+- press and hold `t` key it will record an audio clip
+- use SST to transfer it into text
+- ~~send to a known channel in MC~~
+- Use TTS to speak it back out
+- repeat from #2
+
 ## Ultimate goal
 ### Features
 - Nice enclosure
