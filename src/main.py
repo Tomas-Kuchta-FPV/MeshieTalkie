@@ -6,7 +6,6 @@ import termios
 import time
 import wave
 from pathlib import Path
-from types import SimpleNamespace
 
 import numpy as np
 import sounddevice as sd
@@ -18,9 +17,9 @@ BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_MODEL_DIR = BASE_DIR / "models" / "sherpa-onnx-streaming-zipformer-en-20M-2023-02-17"
 
 
-def assert_file_exists(filename: str):
-    assert Path(filename).is_file(), (
-        f"{filename} does not exist!\n"
+def ensure_file_exists(path: Path):
+    assert path.is_file(), (
+        f"{path} does not exist!\n"
         "Please check that the model files are in src/models."
     )
 
@@ -39,15 +38,15 @@ def transcribe_wav_file(recognizer, wav_path: Path) -> str:
     stream = recognizer.create_stream()
 
     with wave.open(str(wav_path), "rb") as wav_file:
-        sample_rate = wav_file.getframerate()
         if wav_file.getnchannels() != 1:
             raise ValueError("Recorded audio must be mono")
+        sample_rate = wav_file.getframerate()
 
         while True:
-            chunk = wav_file.readframes(4096)
-            if not chunk:
+            frames = wav_file.readframes(4096)
+            if not frames:
                 break
-            samples = np.frombuffer(chunk, dtype=np.int16).astype(np.float32) / 32768.0
+            samples = np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32768.0
             stream.accept_waveform(sample_rate, samples)
             while recognizer.is_ready(stream):
                 recognizer.decode_stream(stream)
@@ -73,45 +72,18 @@ class TerminalRawInput:
     def __exit__(self, exc_type, exc, tb):
         termios.tcsetattr(self.fd, termios.TCSADRAIN, self.previous_settings)
 
-def create_recognizer(args):
-    assert_file_exists(args.encoder)
-    assert_file_exists(args.decoder)
-    assert_file_exists(args.joiner)
-    assert_file_exists(args.tokens)
-    # Please replace the model files if needed.
-    # See https://k2-fsa.github.io/sherpa/onnx/pretrained_models/index.html
-    # for download links.
+def create_recognizer(model_dir: Path):
+    for filename in ("tokens.txt", "encoder-epoch-99-avg-1.int8.onnx", "decoder-epoch-99-avg-1.int8.onnx", "joiner-epoch-99-avg-1.int8.onnx"):
+        ensure_file_exists(model_dir / filename)
+
     recognizer = sherpa_onnx.OnlineRecognizer.from_transducer(
-        tokens=args.tokens,
-        encoder=args.encoder,
-        decoder=args.decoder,
-        joiner=args.joiner,
-        num_threads=1,
-        sample_rate=16000,
-        feature_dim=80,
-        decoding_method=args.decoding_method,
-        max_active_paths=args.max_active_paths,
-        provider=args.provider,
-        hotwords_file=args.hotwords_file,
-        hotwords_score=args.hotwords_score,
-        blank_penalty=args.blank_penalty,
-        hr_rule_fsts=args.hr_rule_fsts,
-        hr_lexicon=args.hr_lexicon,
-    )
-    return recognizer
-
-#*******************************main()*******************************#
-
-def main():
-    print("Starting STT")
-
-    model_dir = Path(str(DEFAULT_MODEL_DIR))
-    print(f"Using model_dir: {model_dir}")
-    args = SimpleNamespace(
         tokens=str(model_dir / "tokens.txt"),
         encoder=str(model_dir / "encoder-epoch-99-avg-1.int8.onnx"),
         decoder=str(model_dir / "decoder-epoch-99-avg-1.int8.onnx"),
         joiner=str(model_dir / "joiner-epoch-99-avg-1.int8.onnx"),
+        num_threads=1,
+        sample_rate=16000,
+        feature_dim=80,
         decoding_method="greedy_search",
         max_active_paths=4,
         provider="cpu",
@@ -121,8 +93,16 @@ def main():
         hr_rule_fsts="",
         hr_lexicon="",
     )
+    return recognizer
 
-    recognizer = create_recognizer(args)
+#*******************************main()*******************************#
+
+def main():
+    print("Starting STT")
+
+    model_dir = DEFAULT_MODEL_DIR
+    print(f"Using model_dir: {model_dir}")
+    recognizer = create_recognizer(model_dir)
     print("Started! Hold 't' to record, then release to transcribe")
 
     sample_rate = 16000
@@ -132,7 +112,6 @@ def main():
     buffer_lock = threading.Lock()
     captured_frames = []
     transcribe_lock = threading.Lock()
-    stop_lock = threading.Lock()
 
     def audio_callback(indata, frames, time_info, status):
         if status:
@@ -150,15 +129,15 @@ def main():
             wav_path = Path(tmp_file.name)
 
         write_wav_file(wav_path, sample_rate, samples)
-        print(f"\nSaved clip to {wav_path}")
+        try:
+            print(f"\nSaved clip to {wav_path}")
 
-        with transcribe_lock:
-            result = transcribe_wav_file(recognizer, wav_path)
+            with transcribe_lock:
+                result = transcribe_wav_file(recognizer, wav_path)
 
-        if result:
-            print(f"Transcript: {result}")
-        else:
-            print("Transcript: <empty>")
+            print(f"Transcript: {result}" if result else "Transcript: <empty>")
+        finally:
+            wav_path.unlink(missing_ok=True) # Clean up the temporary file
 
     def start_recording():
         with buffer_lock:
@@ -168,9 +147,8 @@ def main():
         print("\nRecording... hold 't' until you finish speaking", end="", flush=True)
 
     def stop_recording():
-        with stop_lock:
-            if not recording_active.is_set():
-                return
+        if not recording_active.is_set():
+            return
 
         recording_active.clear()
 
