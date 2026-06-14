@@ -2,3 +2,4 @@ sherpa-onnx
 sherpa-onnx-bin
 sounddevice
 numpy
+pynput
