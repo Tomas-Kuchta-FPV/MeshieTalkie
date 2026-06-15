@@ -9,12 +9,19 @@ from pathlib import Path
 
 import numpy as np
 import sounddevice as sd
-import sherpa_onnx
 
+import tts
+
+# config
 project_name = "meshie-talkie"
 
+# Helpers and Constants
 BASE_DIR = Path(__file__).resolve().parent
-DEFAULT_MODEL_DIR = BASE_DIR / "models" / "sherpa-onnx-whisper-tiny.en"
+DEFAULT_MODELS_DIR = BASE_DIR / "models"
+
+DEFAULT_STT_MODEL_DIR = DEFAULT_MODELS_DIR / "sherpa-onnx-whisper-tiny.en"
+
+TMP_DIR = Path("/tmp") / project_name
 
 
 def ensure_file_exists(path: Path):
@@ -101,7 +108,7 @@ def create_recognizer(model_dir: Path):
 def main():
     print("Starting STT")
 
-    model_dir = DEFAULT_MODEL_DIR
+    model_dir = DEFAULT_STT_MODEL_DIR
     print(f"Using model_dir: {model_dir}")
     recognizer = create_recognizer(model_dir)
     print("Started! Hold 't' to record, then release to transcribe with Whisper")
@@ -137,6 +144,7 @@ def main():
                 result = transcribe_wav_file(recognizer, wav_path)
 
             print(f"Transcript: {result}" if result else "Transcript: <empty>")
+            tts.tts_generate(result)
         finally:
             wav_path.unlink(missing_ok=True) # Clean up the temporary file
 

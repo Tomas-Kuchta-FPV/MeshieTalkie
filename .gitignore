@@ -1,5 +1,8 @@
 ## Project specific
 models/
+*.tar.bz2
+*wav
+*mp3
 ## Python.gitignore
 # Byte-compiled / optimized / DLL files
 __pycache__/
