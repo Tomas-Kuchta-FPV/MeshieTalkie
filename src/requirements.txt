@@ -4,4 +4,4 @@ sherpa-onnx-bin
 sounddevice
 soundfile
 numpy
-pynput
+meshcore

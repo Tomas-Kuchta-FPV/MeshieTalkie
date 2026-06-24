@@ -1,34 +1,106 @@
+import asyncio
 import sys
-import tempfile
 import threading
-import select
-import termios
-import time
 import wave
 from pathlib import Path
 
 import numpy as np
 import sounddevice as sd
+import soundfile as sf
+from meshcore import EventType, MeshCore
 
-import tts
+from keyboard_ptt import KeyboardPttController
+from stt import WhisperTranscriber
+from tts import PiperTTS
 
-# config
-project_name = "meshie-talkie"
-
-# Helpers and Constants
-BASE_DIR = Path(__file__).resolve().parent
-DEFAULT_MODELS_DIR = BASE_DIR / "models"
-
-DEFAULT_STT_MODEL_DIR = DEFAULT_MODELS_DIR / "sherpa-onnx-whisper-tiny.en"
-
-TMP_DIR = Path("/tmp") / project_name
+PROJECT_NAME = "meshie-talkie"
+TMP_DIR = Path("/tmp") / PROJECT_NAME
+SERIAL_PORT = "/dev/ttyACM0"
+MESH_CHANNEL = 2
 
 
-def ensure_file_exists(path: Path):
-    assert path.is_file(), (
-        f"{path} does not exist!\n"
-        "Please check that the model files are in src/models."
-    )
+class MeshBridge:
+    def __init__(self, serial_port: str, channel: int, on_message=None):
+        self.serial_port = serial_port
+        self.channel = channel
+        self.on_message = on_message
+        self._meshcore = None
+        self._loop = None
+        self._send_queue = None
+        self._stop_event = threading.Event()
+        self._ready_event = threading.Event()
+        self._thread = None
+
+    def start(self) -> bool:
+        self._thread = threading.Thread(target=self._run, daemon=True, name="mesh-bridge")
+        self._thread.start()
+        self._ready_event.wait(timeout=10)
+        return self._ready_event.is_set()
+
+    def stop(self):
+        self._stop_event.set()
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=5)
+
+    def send_text(self, text: str) -> bool:
+        if not text or self._loop is None or self._send_queue is None:
+            return False
+        self._loop.call_soon_threadsafe(self._send_queue.put_nowait, text)
+        return True
+
+    def _run(self):
+        asyncio.run(self._run_async())
+
+    async def _run_async(self):
+        try:
+            self._meshcore = await MeshCore.create_serial(self.serial_port)
+            print(f"\nMesh connected on {self.serial_port}")
+        except Exception as exc:
+            print(f"\nMesh connection failed: {exc}")
+            self._ready_event.set()
+            return
+
+        self._loop = asyncio.get_running_loop()
+        self._send_queue = asyncio.Queue()
+        self._ready_event.set()
+
+        try:
+            while not self._stop_event.is_set():
+                try:
+                    while True:
+                        try:
+                            text = self._send_queue.get_nowait()
+                        except Exception:
+                            break
+                        result = await self._meshcore.commands.send_chan_msg(self.channel, text)
+                        if result.type == EventType.ERROR:
+                            print(f"\nMesh send failed: {result.payload}")
+
+                    result = await self._meshcore.commands.get_msg(timeout=0.2)
+                    if result.type == EventType.NO_MORE_MSGS:
+                        await asyncio.sleep(0.05)
+                    elif result.type == EventType.CHANNEL_MSG_RECV:
+                        msg = result.payload
+                        if msg.get("channel_idx") == self.channel:
+                            text = msg.get("text", "").strip()
+                            if text and self.on_message is not None:
+                                self.on_message(text)
+                    elif result.type == EventType.CONTACT_MSG_RECV:
+                        msg = result.payload
+                        text = msg.get("text", "").strip()
+                        if text and self.on_message is not None:
+                            self.on_message(text)
+                except asyncio.CancelledError:
+                    break
+                except Exception as exc:
+                    print(f"\nMesh loop error: {exc}")
+                    await asyncio.sleep(0.5)
+        finally:
+            if self._meshcore is not None:
+                try:
+                    await self._meshcore.disconnect()
+                except Exception:
+                    pass
 
 
 def write_wav_file(filename: Path, sample_rate: int, samples: np.ndarray):
@@ -41,82 +113,48 @@ def write_wav_file(filename: Path, sample_rate: int, samples: np.ndarray):
         wav_file.writeframes(pcm16.tobytes())
 
 
-def transcribe_wav_file(recognizer, wav_path: Path) -> str:
-    stream = recognizer.create_stream()
+def play_wav_file(path: Path):
+    try:
+        audio, sample_rate = sf.read(str(path), dtype="float32")
+        if audio.ndim > 1:
+            audio = np.mean(audio, axis=1)
+        sd.play(audio, sample_rate)
+        sd.wait()
+    except Exception as exc:
+        print(f"Audio playback error: {exc}")
 
-    with wave.open(str(wav_path), "rb") as wav_file:
-        if wav_file.getnchannels() != 1:
-            raise ValueError("Recorded audio must be mono")
-        sample_rate = wav_file.getframerate()
 
-        while True:
-            frames = wav_file.readframes(4096)
-            if not frames:
-                break
-            samples = np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32768.0
-            stream.accept_waveform(sample_rate, samples)
-
-            if hasattr(recognizer, "is_ready"):
-                while recognizer.is_ready(stream):
-                    recognizer.decode_stream(stream)
-
-    if hasattr(stream, "input_finished"):
-        stream.input_finished()
-
-        while recognizer.is_ready(stream):
-            recognizer.decode_stream(stream)
+def sendMC(text: str, mesh_bridge: MeshBridge):
+    if mesh_bridge.send_text(text):
+        print(f"Sent via mesh: {text}")
     else:
-        recognizer.decode_stream(stream)
+        print(f"Mesh unavailable; would send: {text}")
 
-    if hasattr(recognizer, "get_result"):
-        result = recognizer.get_result(stream)
-        return getattr(result, "text", result).strip()
-
-    return getattr(stream.result, "text", str(stream.result)).strip()
-
-
-class TerminalRawInput:
-    def __enter__(self):
-        self.fd = sys.stdin.fileno()
-        self.previous_settings = termios.tcgetattr(self.fd)
-        self.raw_settings = termios.tcgetattr(self.fd)
-        self.raw_settings[3] = self.raw_settings[3] & ~(termios.ECHO | termios.ICANON)
-        self.raw_settings[6][termios.VMIN] = 1
-        self.raw_settings[6][termios.VTIME] = 0
-        termios.tcsetattr(self.fd, termios.TCSADRAIN, self.raw_settings)
-        return self
-
-    def __exit__(self, exc_type, exc, tb):
-        termios.tcsetattr(self.fd, termios.TCSADRAIN, self.previous_settings)
-
-def create_recognizer(model_dir: Path):
-    for filename in ("tiny.en-encoder.int8.onnx", "tiny.en-decoder.int8.onnx", "tiny.en-tokens.txt"):
-        ensure_file_exists(model_dir / filename)
-
-    recognizer = sherpa_onnx.OfflineRecognizer.from_whisper(
-        encoder=str(model_dir / "tiny.en-encoder.int8.onnx"),
-        decoder=str(model_dir / "tiny.en-decoder.int8.onnx"),
-        tokens=str(model_dir / "tiny.en-tokens.txt"),
-        num_threads=1,
-        decoding_method="greedy_search",
-        provider="cpu",
-    )
-    return recognizer
-
-#*******************************main()*******************************#
 
 def main():
-    print("Starting STT")
+    print("Starting meshie talkie...")
 
-    model_dir = DEFAULT_STT_MODEL_DIR
-    print(f"Using model_dir: {model_dir}")
-    recognizer = create_recognizer(model_dir)
-    print("Started! Hold 't' to record, then release to transcribe with Whisper")
+    stt = WhisperTranscriber()
+    tts = PiperTTS(output_dir=TMP_DIR)
+    print(f"Using STT model dir: {stt.model_dir}")
+
+    def handle_mesh_message(text: str):
+        print(f"\nMesh message received: {text}")
+        output_path = tts.synthesize(text)
+        print(f"Saved TTS audio to {output_path}")
+        play_wav_file(output_path)
+
+    mesh_bridge = MeshBridge(
+        serial_port=SERIAL_PORT,
+        channel=MESH_CHANNEL,
+        on_message=handle_mesh_message,
+    )
+    mesh_bridge.start()
+
+    print("Started! Hold 't' to record, then release to transcribe with Whisper\n")
+    print(f"Mesh channel {MESH_CHANNEL} is configured for outgoing and incoming text")
 
     sample_rate = 16000
-    hold_timeout = 0.7
-    restart_cooldown = 1.0
-    recording_active = threading.Event()
     buffer_lock = threading.Lock()
     captured_frames = []
     transcribe_lock = threading.Lock()
@@ -126,41 +164,36 @@ def main():
             print(f"\nAudio status: {status}")
 
         with buffer_lock:
-            if recording_active.is_set():
+            if ptt_controller.is_recording:
                 captured_frames.append(indata.copy())
 
     def process_recording(samples: np.ndarray):
-        temp_dir = Path("/tmp") / project_name
+        temp_dir = TMP_DIR
         temp_dir.mkdir(parents=True, exist_ok=True)
 
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav", dir=temp_dir) as tmp_file:
-            wav_path = Path(tmp_file.name)
+        wav_path = Path(temp_dir / "input_stt.wav")
 
         write_wav_file(wav_path, sample_rate, samples)
         try:
             print(f"\nSaved clip to {wav_path}")
 
             with transcribe_lock:
-                result = transcribe_wav_file(recognizer, wav_path)
+                result = stt.transcribe_file(wav_path)
 
-            print(f"Transcript: {result}" if result else "Transcript: <empty>")
-            tts.tts_generate(result)
+            if result:
+                #print(f"Transcript: {result}")
+                sendMC(result, mesh_bridge)
+            else:
+                print("Transcript: <empty>")
         finally:
-            wav_path.unlink(missing_ok=True) # Clean up the temporary file
+            print("\nReady for next recording. Hold 't' to record again.")
 
     def start_recording():
         with buffer_lock:
             captured_frames.clear()
-
-        recording_active.set()
         print("\nRecording... hold 't' until you finish speaking", end="", flush=True)
 
     def stop_recording():
-        if not recording_active.is_set():
-            return
-
-        recording_active.clear()
-
         with buffer_lock:
             frames = [frame.copy() for frame in captured_frames]
             captured_frames.clear()
@@ -172,45 +205,30 @@ def main():
         samples = np.concatenate(frames, axis=0).reshape(-1)
         threading.Thread(target=process_recording, args=(samples,), daemon=True).start()
 
-    def poll_keyboard_input():
-        last_t_time = None
-        cooldown_until = 0.0
-        with TerminalRawInput():
-            while True:
-                ready, _, _ = select.select([sys.stdin], [], [], 0.05)
-                if ready:
-                    char = sys.stdin.read(1)
-                    if char == "\x03":
-                        raise KeyboardInterrupt
-                    if char.lower() == "t":
-                        now = time.monotonic()
-                        if now < cooldown_until:
-                            continue
+    ptt_controller = KeyboardPttController(
+        hold_timeout=0.7,
+        restart_cooldown=1.0,
+        on_record_start=start_recording,
+        on_record_stop=stop_recording,
+    )
 
-                        if not recording_active.is_set():
-                            start_recording()
-                        last_t_time = now
+    try:
+        with sd.InputStream(
+            channels=1,
+            dtype="float32",
+            samplerate=sample_rate,
+            callback=audio_callback,
+        ):
+            ptt_controller.run()
+    finally:
+        mesh_bridge.stop()
 
-                if recording_active.is_set() and last_t_time is not None:
-                    now = time.monotonic()
-                    if now - last_t_time >= hold_timeout:
-                        stop_recording()
-                        cooldown_until = now + restart_cooldown
-                        last_t_time = None
 
-    with sd.InputStream(
-        channels=1,
-        dtype="float32",
-        samplerate=sample_rate,
-        callback=audio_callback,
-    ):
-        poll_keyboard_input()
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
         print("\nCaught Ctrl + C. Exiting")
-    except Exception as e:
-        print(f"Error: {e}")
+    except Exception as exc:
+        print(f"Error: {exc}")
         sys.exit(1)

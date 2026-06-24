@@ -1,27 +1,44 @@
-# tts.py should take in a text string and return the path to a wav file containing the generated speech. It uses lib sherpa-onnx.
+from pathlib import Path
+
 import sherpa_onnx
 import soundfile as sf
-import main
 
-DEFAULT_TTS_MODEL_DIR = main.DEFAULT_MODELS_DIR / "vits-piper-en_US-amy-low"
+BASE_DIR = Path(__file__).resolve().parent
+DEFAULT_MODELS_DIR = BASE_DIR / "models"
+DEFAULT_TTS_MODEL_DIR = DEFAULT_MODELS_DIR / "vits-piper-en_US-amy-low"
+DEFAULT_OUTPUT_DIR = Path("/tmp") / "meshie-talkie"
 
-config = sherpa_onnx.OfflineTtsConfig(
-    model=sherpa_onnx.OfflineTtsModelConfig(
-        vits=sherpa_onnx.OfflineTtsVitsModelConfig(
-            model=f"{DEFAULT_TTS_MODEL_DIR}/en_US-amy-low.onnx",
-            data_dir=f"{DEFAULT_TTS_MODEL_DIR}/espeak-ng-data",
-            tokens=f"{DEFAULT_TTS_MODEL_DIR}/tokens.txt",
-        ),
-        num_threads=1,
-    ),
-)
 
-if not config.validate():
-    raise ValueError(f"Please check your path {config.model.vits.model} and ensure the \"vits-piper-en_US-amy-low\" model is installed")
+class PiperTTS:
+    def __init__(self, model_dir: Path | None = None, output_dir: Path | None = None):
+        self.model_dir = Path(model_dir or DEFAULT_TTS_MODEL_DIR)
+        self.output_dir = Path(output_dir or DEFAULT_OUTPUT_DIR)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
 
-def tts_generate(text: str, sid: int = 0, speed: float = 1.0):
-    tts = sherpa_onnx.OfflineTts(config)
-    audio = tts.generate(text=text, sid=sid, speed=speed)
-    audio_path = sf.write(f"{main.TMP_DIR}/output_tts.wav", audio.samples, samplerate=audio.sample_rate)
-    return audio_path
+        self.config = sherpa_onnx.OfflineTtsConfig(
+            model=sherpa_onnx.OfflineTtsModelConfig(
+                vits=sherpa_onnx.OfflineTtsVitsModelConfig(
+                    model=str(self.model_dir / "en_US-amy-low.onnx"),
+                    data_dir=str(self.model_dir / "espeak-ng-data"),
+                    tokens=str(self.model_dir / "tokens.txt"),
+                ),
+                num_threads=1,
+            ),
+        )
+
+        if not self.config.validate():
+            raise ValueError(
+                f"Please check your path {self.config.model.vits.model} and ensure the \"vits-piper-en_US-amy-low\" model is installed"
+            )
+
+    def synthesize(self, text: str, sid: int = 0, speed: float = 1.0, output_path: Path | str | None = None):
+        if output_path is None:
+            output_path = self.output_dir / "output_tts.wav"
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        tts = sherpa_onnx.OfflineTts(self.config)
+        audio = tts.generate(text=text, sid=sid, speed=speed)
+        sf.write(str(output_path), audio.samples, samplerate=audio.sample_rate)
+        return output_path
 
